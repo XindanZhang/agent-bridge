@@ -5,6 +5,7 @@ import type { ServerWebSocket } from "bun";
 import { CodexAdapter } from "./codex-adapter";
 import { FrontendRegistry, formatPeerMessageForCodex } from "./frontend-registry";
 import { classifySocketSendStatus } from "./socket-send-status";
+import { StateDirResolver } from "./state-dir";
 import {
   BRIDGE_CONTRACT_REMINDER,
   StatusBuffer,
@@ -23,11 +24,14 @@ interface ControlSocketData {
   frontendSource?: FrontendSource;
 }
 
+const stateDir = new StateDirResolver();
+stateDir.ensure();
+
 const CODEX_APP_PORT = parseInt(process.env.CODEX_WS_PORT ?? "4500", 10);
 const CODEX_PROXY_PORT = parseInt(process.env.CODEX_PROXY_PORT ?? "4501", 10);
 const CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
-const PID_FILE = process.env.AGENTBRIDGE_PID_FILE ?? `/tmp/agentbridge-daemon-${CONTROL_PORT}.pid`;
-const LOG_FILE = "/tmp/agentbridge.log";
+const PID_FILE = process.env.AGENTBRIDGE_PID_FILE ?? stateDir.pidFile;
+const LOG_FILE = process.env.AGENTBRIDGE_LOG_FILE ?? stateDir.logFile;
 const TUI_DISCONNECT_GRACE_MS = parseInt(process.env.TUI_DISCONNECT_GRACE_MS ?? "2500", 10);
 const MAX_BUFFERED_MESSAGES = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES ?? "100", 10);
 const FILTER_MODE: FilterMode =

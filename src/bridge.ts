@@ -1,27 +1,38 @@
 #!/usr/bin/env bun
 
-import { spawn } from "node:child_process";
-import { appendFileSync, readFileSync, unlinkSync } from "node:fs";
+import { appendFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { ClaudeAdapter } from "./claude-adapter";
 import { DaemonClient } from "./daemon-client";
+import { DaemonLaunchCoordinator } from "./daemon-launch";
 import { buildFrontendIdentity } from "./frontend-identity";
+import { StateDirResolver } from "./state-dir";
 import type { BridgeMessage, FrontendSource } from "./types";
 
+const stateDir = new StateDirResolver();
+stateDir.ensure();
+
 const CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
-const PID_FILE = process.env.AGENTBRIDGE_PID_FILE ?? `/tmp/agentbridge-daemon-${CONTROL_PORT}.pid`;
-const CONTROL_HEALTH_URL = `http://127.0.0.1:${CONTROL_PORT}/healthz`;
-const CONTROL_WS_URL = `ws://127.0.0.1:${CONTROL_PORT}/ws`;
-const LOG_FILE = "/tmp/agentbridge.log";
+const PID_FILE = process.env.AGENTBRIDGE_PID_FILE ?? stateDir.pidFile;
+const LOCK_FILE = process.env.AGENTBRIDGE_LOCK_FILE ?? stateDir.lockFile;
+const LOG_FILE = process.env.AGENTBRIDGE_LOG_FILE ?? stateDir.logFile;
 const DAEMON_PATH = fileURLToPath(new URL("./daemon.ts", import.meta.url));
 const FRONTEND_SOURCE: FrontendSource =
   (process.env.AGENTBRIDGE_FRONTEND_TYPE as FrontendSource) === "gemini" ? "gemini" : "claude";
 const FRONTEND_NAME = process.env.AGENTBRIDGE_FRONTEND_NAME
   ?? (FRONTEND_SOURCE === "gemini" ? "Gemini" : "Claude");
 const FRONTEND_IDENTITY = buildFrontendIdentity(FRONTEND_SOURCE, FRONTEND_NAME);
+const daemonLifecycle = new DaemonLaunchCoordinator({
+  controlPort: CONTROL_PORT,
+  daemonPath: DAEMON_PATH,
+  stateDir: stateDir.dir,
+  pidFile: PID_FILE,
+  lockFile: LOCK_FILE,
+  log,
+});
 
 const frontendAdapter = new ClaudeAdapter();
-const daemonClient = new DaemonClient(CONTROL_WS_URL, FRONTEND_IDENTITY, {
+const daemonClient = new DaemonClient(daemonLifecycle.controlWsUrl, FRONTEND_IDENTITY, {
   beforeReconnect: ensureDaemonRunning,
 });
 
@@ -95,85 +106,7 @@ function systemMessage(idPrefix: string, content: string): BridgeMessage {
 }
 
 async function ensureDaemonRunning() {
-  if (await isDaemonHealthy()) {
-    return;
-  }
-
-  const existingPid = readDaemonPid();
-  if (existingPid) {
-    if (isProcessAlive(existingPid)) {
-      try {
-        await waitForDaemonHealthy(12, 250);
-        return;
-      } catch {
-        throw new Error(
-          `Found existing daemon process ${existingPid}, but control port ${CONTROL_PORT} never became healthy.`,
-        );
-      }
-    }
-
-    removeStalePidFile();
-  }
-
-  launchDaemon();
-  await waitForDaemonHealthy();
-}
-
-function launchDaemon() {
-  log(`Launching detached daemon on control port ${CONTROL_PORT}`);
-
-  const daemonProc = spawn(process.execPath, ["run", DAEMON_PATH], {
-    cwd: process.cwd(),
-    env: { ...process.env },
-    detached: true,
-    stdio: "ignore",
-  });
-  daemonProc.unref();
-}
-
-async function isDaemonHealthy() {
-  try {
-    const response = await fetch(CONTROL_HEALTH_URL);
-    return response.ok;
-  } catch {
-    return false;
-  }
-}
-
-async function waitForDaemonHealthy(maxRetries = 40, delayMs = 250) {
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    if (await isDaemonHealthy()) return;
-    await new Promise((resolve) => setTimeout(resolve, delayMs));
-  }
-
-  throw new Error(`Timed out waiting for AgentBridge daemon health on ${CONTROL_HEALTH_URL}`);
-}
-
-function readDaemonPid() {
-  try {
-    const raw = readFileSync(PID_FILE, "utf-8").trim();
-    if (!raw) return null;
-
-    const pid = Number.parseInt(raw, 10);
-    return Number.isFinite(pid) ? pid : null;
-  } catch {
-    return null;
-  }
-}
-
-function isProcessAlive(pid: number) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function removeStalePidFile() {
-  try {
-    unlinkSync(PID_FILE);
-  } catch {}
+  await daemonLifecycle.ensureRunning();
 }
 
 function shutdown(reason: string) {
@@ -214,7 +147,7 @@ function log(msg: string) {
   } catch {}
 }
 
-log(`Starting AgentBridge frontend ${FRONTEND_NAME} (daemon ws ${CONTROL_WS_URL})`);
+log(`Starting AgentBridge frontend ${FRONTEND_NAME} (daemon ws ${daemonLifecycle.controlWsUrl})`);
 
 (async () => {
   try {
