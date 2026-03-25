@@ -1,12 +1,31 @@
 // ===== Bridge Core Types =====
 
-export type MessageSource = "claude" | "codex";
+export type FrontendSource = "claude" | "gemini";
+export type MessageSource = FrontendSource | "codex";
+
+export interface FrontendIdentity {
+  id: string;
+  source: FrontendSource;
+  name: string;
+}
 
 export interface BridgeMessage {
   id: string;
   source: MessageSource;
   content: string;
   timestamp: number;
+}
+
+export function sourceLabel(source: MessageSource) {
+  switch (source) {
+    case "claude":
+      return "Claude";
+    case "gemini":
+      return "Gemini";
+    case "codex":
+    default:
+      return "Codex";
+  }
 }
 
 // ===== JSON-RPC 2.0 =====

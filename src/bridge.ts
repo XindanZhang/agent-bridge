@@ -5,7 +5,8 @@ import { appendFileSync, readFileSync, unlinkSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { ClaudeAdapter } from "./claude-adapter";
 import { DaemonClient } from "./daemon-client";
-import type { BridgeMessage } from "./types";
+import { buildFrontendIdentity } from "./frontend-identity";
+import type { BridgeMessage, FrontendSource } from "./types";
 
 const CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
 const PID_FILE = process.env.AGENTBRIDGE_PID_FILE ?? `/tmp/agentbridge-daemon-${CONTROL_PORT}.pid`;
@@ -13,23 +14,28 @@ const CONTROL_HEALTH_URL = `http://127.0.0.1:${CONTROL_PORT}/healthz`;
 const CONTROL_WS_URL = `ws://127.0.0.1:${CONTROL_PORT}/ws`;
 const LOG_FILE = "/tmp/agentbridge.log";
 const DAEMON_PATH = fileURLToPath(new URL("./daemon.ts", import.meta.url));
+const FRONTEND_SOURCE: FrontendSource =
+  (process.env.AGENTBRIDGE_FRONTEND_TYPE as FrontendSource) === "gemini" ? "gemini" : "claude";
+const FRONTEND_NAME = process.env.AGENTBRIDGE_FRONTEND_NAME
+  ?? (FRONTEND_SOURCE === "gemini" ? "Gemini" : "Claude");
+const FRONTEND_IDENTITY = buildFrontendIdentity(FRONTEND_SOURCE, FRONTEND_NAME);
 
-const claude = new ClaudeAdapter();
-const daemonClient = new DaemonClient(CONTROL_WS_URL);
+const frontendAdapter = new ClaudeAdapter();
+const daemonClient = new DaemonClient(CONTROL_WS_URL, FRONTEND_IDENTITY);
 
 let shuttingDown = false;
 
-claude.setReplySender(async (msg: BridgeMessage) => {
-  if (msg.source !== "claude") {
+frontendAdapter.setReplySender(async (msg: BridgeMessage) => {
+  if (msg.source !== FRONTEND_SOURCE) {
     return { success: false, error: "Invalid message source" };
   }
 
   return daemonClient.sendReply(msg);
 });
 
-daemonClient.on("codexMessage", (message) => {
-  log(`Forwarding daemon → Claude (${message.content.length} chars)`);
-  void claude.pushNotification(message);
+daemonClient.on("bridgeMessage", (message) => {
+  log(`Forwarding daemon → ${FRONTEND_NAME} (${message.content.length} chars)`);
+  void frontendAdapter.pushNotification(message);
 });
 
 daemonClient.on("status", (status) => {
@@ -42,22 +48,22 @@ daemonClient.on("disconnect", () => {
   if (shuttingDown) return;
 
   log("Daemon control connection closed");
-  void claude.pushNotification(systemMessage(
+  void frontendAdapter.pushNotification(systemMessage(
     "system_daemon_disconnected",
-    "⚠️ AgentBridge daemon control connection lost. The Codex proxy may still be running in the background, but Claude cannot communicate bidirectionally right now.",
+    `⚠️ AgentBridge daemon control connection lost. The Codex proxy may still be running in the background, but ${FRONTEND_NAME} cannot communicate bidirectionally right now.`,
   ));
 });
 
-claude.on("ready", async () => {
-  log(`MCP server ready (delivery mode: ${claude.getDeliveryMode()}) — ensuring AgentBridge daemon...`);
+frontendAdapter.on("ready", async () => {
+  log(`MCP server ready for ${FRONTEND_NAME} (delivery mode: ${frontendAdapter.getDeliveryMode()}) — ensuring AgentBridge daemon...`);
 
   try {
     await ensureDaemonRunning();
     await daemonClient.connect();
-    daemonClient.attachClaude();
+    daemonClient.attachFrontend();
   } catch (err: any) {
     log(`Failed to connect to daemon: ${err.message}`);
-    await claude.pushNotification(
+    await frontendAdapter.pushNotification(
       systemMessage(
         "system_daemon_connect_failed",
         `❌ AgentBridge daemon failed to start or is unreachable: ${err.message}`,
@@ -160,7 +166,7 @@ function removeStalePidFile() {
 function shutdown(reason: string) {
   if (shuttingDown) return;
   shuttingDown = true;
-  log(`Shutting down Claude frontend (${reason})...`);
+  log(`Shutting down ${FRONTEND_NAME} frontend (${reason})...`);
   const hardExit = setTimeout(() => {
     log("Shutdown timed out waiting for daemon disconnect; forcing exit");
     process.exit(0);
@@ -195,11 +201,11 @@ function log(msg: string) {
   } catch {}
 }
 
-log(`Starting AgentBridge frontend (daemon ws ${CONTROL_WS_URL})`);
+log(`Starting AgentBridge frontend ${FRONTEND_NAME} (daemon ws ${CONTROL_WS_URL})`);
 
 (async () => {
   try {
-    await claude.start();
+    await frontendAdapter.start();
   } catch (err: any) {
     log(`Fatal: failed to start MCP server: ${err.message}`);
   }

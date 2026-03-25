@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { ClaudeAdapter, CLAUDE_INSTRUCTIONS } from "./claude-adapter";
+import { ClaudeAdapter, CLAUDE_INSTRUCTIONS, buildFrontendInstructions } from "./claude-adapter";
 import { BRIDGE_CONTRACT_REMINDER } from "./message-filter";
 
 describe("role-aware collaboration guidance", () => {
@@ -19,6 +19,12 @@ describe("role-aware collaboration guidance", () => {
     expect(CLAUDE_INSTRUCTIONS).toContain("Codex is working");
     expect(CLAUDE_INSTRUCTIONS).toContain("Codex finished");
     expect(CLAUDE_INSTRUCTIONS).toContain("busy error");
+  });
+
+  test("gemini instructions are generated with the Gemini role label", () => {
+    const instructions = buildFrontendInstructions("Gemini");
+    expect(instructions).toContain("Gemini: Reviewer, Planner, Hypothesis Challenger");
+    expect(instructions).not.toContain("Claude: Reviewer, Planner, Hypothesis Challenger");
   });
 
   test("bridge contract reminder includes codex role guidance", () => {

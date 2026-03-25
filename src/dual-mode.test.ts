@@ -122,6 +122,30 @@ describe("Dual-mode transport: pull mode message queue", () => {
   });
 });
 
+describe("Dual-mode transport: push mode notifications", () => {
+  test("pushNotification preserves the original message source in channel metadata", async () => {
+    const adapter = createAdapter("push");
+    adapter.resolveMode();
+
+    let captured: any;
+    adapter.server.notification = async (payload: any) => {
+      captured = payload;
+    };
+
+    await adapter.pushNotification({
+      id: "gemini_1",
+      source: "gemini",
+      content: "I disagree with the current design",
+      timestamp: 1705312205000,
+    });
+
+    expect(captured.params.meta.user).toBe("Gemini");
+    expect(captured.params.meta.user_id).toBe("gemini");
+    expect(captured.params.meta.source_type).toBe("gemini");
+    expect(captured.params.content).toBe("I disagree with the current design");
+  });
+});
+
 describe("Dual-mode transport: drainMessages (get_messages)", () => {
   test("returns 'no new messages' when queue is empty", () => {
     const adapter = createAdapter("pull");
@@ -180,6 +204,28 @@ describe("Dual-mode transport: drainMessages (get_messages)", () => {
 
     const result = adapter.drainMessages();
     expect(result.content[0].text).toContain("[1 new message from Codex]");
+  });
+
+  test("formats source labels for non-Codex peers in pull mode", () => {
+    const adapter = createAdapter("pull");
+    adapter.resolveMode();
+
+    adapter.queueForPull({
+      id: "claude_1",
+      source: "claude",
+      content: "review this approach",
+      timestamp: 1705312200000,
+    });
+    adapter.queueForPull({
+      id: "gemini_1",
+      source: "gemini",
+      content: "I disagree with the current design",
+      timestamp: 1705312205000,
+    });
+
+    const text = adapter.drainMessages().content[0].text;
+    expect(text).toContain("Claude: review this approach");
+    expect(text).toContain("Gemini: I disagree with the current design");
   });
 });
 

@@ -1,9 +1,9 @@
 import { EventEmitter } from "node:events";
-import type { BridgeMessage } from "./types";
+import type { BridgeMessage, FrontendIdentity } from "./types";
 import type { ControlClientMessage, ControlServerMessage, DaemonStatus } from "./control-protocol";
 
 interface DaemonClientEvents {
-  codexMessage: [BridgeMessage];
+  bridgeMessage: [BridgeMessage];
   disconnect: [];
   status: [DaemonStatus];
 }
@@ -19,7 +19,10 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
     }
   >();
 
-  constructor(private readonly url: string) {
+  constructor(
+    private readonly url: string,
+    private readonly frontend: FrontendIdentity,
+  ) {
     super();
   }
 
@@ -51,15 +54,15 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
     });
   }
 
-  attachClaude() {
-    this.send({ type: "claude_connect" });
+  attachFrontend() {
+    this.send({ type: "frontend_connect", frontend: this.frontend });
   }
 
   async disconnect() {
     if (!this.ws) return;
 
     try {
-      this.send({ type: "claude_disconnect" });
+      this.send({ type: "frontend_disconnect", frontendId: this.frontend.id });
     } catch {}
 
     try {
@@ -84,7 +87,7 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
 
       this.pendingReplies.set(requestId, { resolve, timer });
       this.send({
-        type: "claude_to_codex",
+        type: "frontend_to_codex",
         requestId,
         message,
       });
@@ -103,9 +106,11 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
       }
 
       switch (message.type) {
+        case "bridge_message":
         case "codex_to_claude":
-          this.emit("codexMessage", message.message);
+          this.emit("bridgeMessage", message.message);
           return;
+        case "frontend_to_codex_result":
         case "claude_to_codex_result": {
           const pending = this.pendingReplies.get(message.requestId);
           if (!pending) return;

@@ -20,44 +20,48 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { EventEmitter } from "node:events";
 import { appendFileSync } from "node:fs";
-import type { BridgeMessage } from "./types";
+import { sourceLabel, type BridgeMessage, type FrontendSource } from "./types";
 
 export type ReplySender = (msg: BridgeMessage) => Promise<{ success: boolean; error?: string }>;
 export type DeliveryMode = "push" | "pull" | "auto";
 
-export const CLAUDE_INSTRUCTIONS = [
-  "Codex is an AI coding agent (OpenAI) running in a separate session on the same machine.",
-  "",
-  "## Message delivery",
-  "Messages from Codex may arrive in two ways depending on the connection mode:",
-  "- As <channel source=\"agentbridge\" chat_id=\"...\" user=\"Codex\" ...> tags (push mode)",
-  "- Via the get_messages tool (pull mode)",
-  "",
-  "## Collaboration roles",
-  "Default roles in this setup:",
-  "- Claude: Reviewer, Planner, Hypothesis Challenger",
-  "- Codex: Implementer, Executor, Reproducer/Verifier",
-  "- Expect Codex to provide independent technical judgment and evidence, not passive agreement.",
-  "",
-  "## Thinking patterns (task-driven)",
-  "- Analytical/review tasks: Independent Analysis & Convergence",
-  "- Implementation tasks: Architect -> Builder -> Critic",
-  "- Debugging tasks: Hypothesis -> Experiment -> Interpretation",
-  "",
-  "## Collaboration language",
-  "- Use explicit phrases such as \"My independent view is:\", \"I agree on:\", \"I disagree on:\", and \"Current consensus:\".",
-  "",
-  "## How to interact",
-  "- Use the reply tool to send messages back to Codex — pass chat_id back.",
-  "- Use the get_messages tool to check for pending messages from Codex.",
-  "- After sending a reply, call get_messages to check for responses.",
-  "- When the user asks about Codex status or progress, call get_messages.",
-  "",
-  "## Turn coordination",
-  "- When you see '⏳ Codex is working', do NOT call the reply tool — wait for '✅ Codex finished'.",
-  "- After Codex finishes a turn, you have an attention window to review and respond before new messages arrive.",
-  "- If the reply tool returns a busy error, Codex is still executing — wait and try again later.",
-].join("\n");
+export function buildFrontendInstructions(frontendName: string) {
+  return [
+    "Codex is an AI coding agent (OpenAI) running in a separate session on the same machine.",
+    "",
+    "## Message delivery",
+    "Messages from AgentBridge may arrive in two ways depending on the connection mode:",
+    "- As <channel source=\"agentbridge\" chat_id=\"...\" user=\"Codex|Claude|Gemini\" ...> tags (push mode)",
+    "- Via the get_messages tool (pull mode)",
+    "",
+    "## Collaboration roles",
+    "Default roles in this setup:",
+    `- ${frontendName}: Reviewer, Planner, Hypothesis Challenger`,
+    "- Codex: Implementer, Executor, Reproducer/Verifier",
+    "- Expect Codex to provide independent technical judgment and evidence, not passive agreement.",
+    "",
+    "## Thinking patterns (task-driven)",
+    "- Analytical/review tasks: Independent Analysis & Convergence",
+    "- Implementation tasks: Architect -> Builder -> Critic",
+    "- Debugging tasks: Hypothesis -> Experiment -> Interpretation",
+    "",
+    "## Collaboration language",
+    "- Use explicit phrases such as \"My independent view is:\", \"I agree on:\", \"I disagree on:\", and \"Current consensus:\".",
+    "",
+    "## How to interact",
+    "- Use the reply tool to send messages back to Codex — pass chat_id back.",
+    "- Use the get_messages tool to check for pending messages from AgentBridge.",
+    "- After sending a reply, call get_messages to check for responses.",
+    "- When the user asks about Codex status or progress, call get_messages.",
+    "",
+    "## Turn coordination",
+    "- When you see '⏳ Codex is working', do NOT call the reply tool — wait for '✅ Codex finished'.",
+    "- After Codex finishes a turn, you have an attention window to review and respond before new messages arrive.",
+    "- If the reply tool returns a busy error, Codex is still executing — wait and try again later.",
+  ].join("\n");
+}
+
+export const CLAUDE_INSTRUCTIONS = buildFrontendInstructions("Claude");
 
 const LOG_FILE = "/tmp/agentbridge.log";
 
@@ -66,6 +70,8 @@ export class ClaudeAdapter extends EventEmitter {
   private notificationSeq = 0;
   private sessionId: string;
   private replySender: ReplySender | null = null;
+  private readonly frontendSource: FrontendSource;
+  private readonly frontendName: string;
 
   // Dual-mode transport
   private readonly configuredMode: DeliveryMode;
@@ -77,6 +83,9 @@ export class ClaudeAdapter extends EventEmitter {
   constructor() {
     super();
     this.sessionId = `codex_${Date.now()}`;
+    this.frontendSource = (process.env.AGENTBRIDGE_FRONTEND_TYPE as FrontendSource) === "gemini" ? "gemini" : "claude";
+    this.frontendName = process.env.AGENTBRIDGE_FRONTEND_NAME
+      ?? (this.frontendSource === "gemini" ? "Gemini" : "Claude");
 
     const envMode = process.env.AGENTBRIDGE_MODE as DeliveryMode | undefined;
     this.configuredMode = envMode && ["push", "pull", "auto"].includes(envMode) ? envMode : "auto";
@@ -89,7 +98,9 @@ export class ClaudeAdapter extends EventEmitter {
           experimental: { "claude/channel": {} },
           tools: {},
         },
-        instructions: CLAUDE_INSTRUCTIONS,
+        instructions: this.frontendSource === "claude"
+          ? CLAUDE_INSTRUCTIONS
+          : buildFrontendInstructions(this.frontendName),
       },
     );
 
@@ -153,6 +164,7 @@ export class ClaudeAdapter extends EventEmitter {
   private async pushViaChannel(message: BridgeMessage) {
     const msgId = `codex_msg_${++this.notificationSeq}`;
     const ts = new Date(message.timestamp).toISOString();
+    const speaker = sourceLabel(message.source);
 
     try {
       await this.server.notification({
@@ -162,10 +174,10 @@ export class ClaudeAdapter extends EventEmitter {
           meta: {
             chat_id: this.sessionId,
             message_id: msgId,
-            user: "Codex",
-            user_id: "codex",
+            user: speaker,
+            user_id: message.source,
             ts,
-            source_type: "codex",
+            source_type: message.source,
           },
         },
       });
@@ -203,7 +215,9 @@ export class ClaudeAdapter extends EventEmitter {
     this.droppedMessageCount = 0;
 
     const count = messages.length;
-    let header = `[${count} new message${count > 1 ? "s" : ""} from Codex]`;
+    const uniqueSources = [...new Set(messages.map((msg) => msg.source))];
+    const headerSource = uniqueSources.length === 1 ? sourceLabel(uniqueSources[0]) : "AgentBridge";
+    let header = `[${count} new message${count > 1 ? "s" : ""} from ${headerSource}]`;
     if (dropped > 0) {
       header += ` (${dropped} older message${dropped > 1 ? "s" : ""} were dropped due to queue overflow)`;
     }
@@ -212,7 +226,7 @@ export class ClaudeAdapter extends EventEmitter {
     const formatted = messages
       .map((msg, i) => {
         const ts = new Date(msg.timestamp).toISOString();
-        return `---\n[${i + 1}] ${ts}\nCodex: ${msg.content}`;
+        return `---\n[${i + 1}] ${ts}\n${sourceLabel(msg.source)}: ${msg.content}`;
       })
       .join("\n\n");
 
@@ -292,7 +306,7 @@ export class ClaudeAdapter extends EventEmitter {
 
     const bridgeMsg: BridgeMessage = {
       id: (args?.chat_id as string) ?? `reply_${Date.now()}`,
-      source: "claude",
+      source: this.frontendSource,
       content: text,
       timestamp: Date.now(),
     };
@@ -318,7 +332,9 @@ export class ClaudeAdapter extends EventEmitter {
     const pending = this.pendingMessages.length;
     let responseText = "Reply sent to Codex.";
     if (pending > 0) {
-      responseText += ` Note: ${pending} unread Codex message${pending > 1 ? "s" : ""} already waiting \u2014 call get_messages to read them.`;
+      const queuedSources = [...new Set(this.pendingMessages.map((msg) => msg.source))];
+      const pendingLabel = queuedSources.length === 1 ? sourceLabel(queuedSources[0]) : "AgentBridge";
+      responseText += ` Note: ${pending} unread ${pendingLabel} message${pending > 1 ? "s" : ""} already waiting \u2014 call get_messages to read them.`;
     }
 
     return {
@@ -327,7 +343,7 @@ export class ClaudeAdapter extends EventEmitter {
   }
 
   private log(msg: string) {
-    const line = `[${new Date().toISOString()}] [ClaudeAdapter] ${msg}\n`;
+    const line = `[${new Date().toISOString()}] [${this.frontendName}Adapter] ${msg}\n`;
     process.stderr.write(line);
     try {
       appendFileSync(LOG_FILE, line);

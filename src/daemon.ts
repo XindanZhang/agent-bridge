@@ -3,6 +3,7 @@
 import { appendFileSync, unlinkSync, writeFileSync } from "node:fs";
 import type { ServerWebSocket } from "bun";
 import { CodexAdapter } from "./codex-adapter";
+import { FrontendRegistry, formatPeerMessageForCodex } from "./frontend-registry";
 import {
   BRIDGE_CONTRACT_REMINDER,
   StatusBuffer,
@@ -11,11 +12,14 @@ import {
 } from "./message-filter";
 import { TuiConnectionState } from "./tui-connection-state";
 import type { ControlClientMessage, ControlServerMessage, DaemonStatus } from "./control-protocol";
-import type { BridgeMessage } from "./types";
+import { sourceLabel, type BridgeMessage, type FrontendSource } from "./types";
 
 interface ControlSocketData {
   clientId: number;
   attached: boolean;
+  frontendId?: string;
+  frontendName?: string;
+  frontendSource?: FrontendSource;
 }
 
 const CODEX_APP_PORT = parseInt(process.env.CODEX_WS_PORT ?? "4500", 10);
@@ -34,7 +38,7 @@ const codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT);
 const attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
 
 let controlServer: ReturnType<typeof Bun.serve> | null = null;
-let attachedClaude: ServerWebSocket<ControlSocketData> | null = null;
+const frontends = new FrontendRegistry<ServerWebSocket<ControlSocketData>>();
 let nextControlClientId = 0;
 let nextSystemMessageId = 0;
 let codexBootstrapped = false;
@@ -49,7 +53,7 @@ const tuiConnectionState = new TuiConnectionState({
   disconnectGraceMs: TUI_DISCONNECT_GRACE_MS,
   log,
   onDisconnectPersisted: (connId) => {
-    emitToClaude(
+    emitToFrontends(
       systemMessage(
         "system_tui_disconnected",
         `⚠️ Codex TUI disconnected (conn #${connId}). Codex is still running in the background — reconnect the TUI to resume.`,
@@ -57,21 +61,21 @@ const tuiConnectionState = new TuiConnectionState({
     );
   },
   onReconnectAfterNotice: (connId) => {
-    emitToClaude(
+    emitToFrontends(
       systemMessage(
         "system_tui_reconnected",
         `✅ Codex TUI reconnected (conn #${connId}). Bridge restored, communication can continue.`,
       ),
     );
-    codex.injectMessage("✅ Claude Code is still online, bridge restored. Bidirectional communication can continue.");
+    codex.injectMessage("✅ AgentBridge frontend connection restored. Bidirectional communication can continue.");
   },
 });
 
-const statusBuffer = new StatusBuffer((summary) => emitToClaude(summary));
+const statusBuffer = new StatusBuffer((summary) => emitToFrontends(summary));
 
 codex.on("turnStarted", () => {
   log("Codex turn started");
-  emitToClaude(
+  emitToFrontends(
     systemMessage(
       "system_turn_started",
       "⏳ Codex is working on the current task. Wait for completion before sending a reply.",
@@ -83,21 +87,21 @@ codex.on("agentMessage", (msg: BridgeMessage) => {
   if (msg.source !== "codex") return;
   const result = classifyMessage(msg.content, FILTER_MODE);
 
-  // During attention window, suppress STATUS to give Claude space to respond
+  // During attention window, suppress STATUS to give the connected frontends space to respond
   if (inAttentionWindow && result.marker === "status") {
-    log(`Codex → Claude [${result.marker}/buffer-attention] (${msg.content.length} chars)`);
+    log(`Codex → frontends [${result.marker}/buffer-attention] (${msg.content.length} chars)`);
     statusBuffer.add(msg);
     return;
   }
 
-  log(`Codex → Claude [${result.marker}/${result.action}] (${msg.content.length} chars)`);
+  log(`Codex → frontends [${result.marker}/${result.action}] (${msg.content.length} chars)`);
   switch (result.action) {
     case "forward":
       if (result.marker === "important" && statusBuffer.size > 0) {
         statusBuffer.flush("important message arrived");
       }
-      emitToClaude(msg);
-      // IMPORTANT message — give Claude an attention window to respond
+      emitToFrontends(msg);
+      // IMPORTANT message — give the connected frontends an attention window to respond
       if (result.marker === "important") {
         startAttentionWindow();
       }
@@ -113,7 +117,7 @@ codex.on("agentMessage", (msg: BridgeMessage) => {
 codex.on("turnCompleted", () => {
   log("Codex turn completed");
   statusBuffer.flush("turn completed");
-  emitToClaude(
+  emitToFrontends(
     systemMessage(
       "system_turn_completed",
       "✅ Codex finished the current turn. You can reply now if needed.",
@@ -127,12 +131,12 @@ codex.on("ready", (threadId: string) => {
   log(`Codex ready — thread ${threadId}`);
   log("Bridge fully operational");
 
-  emitToClaude(
+  emitToFrontends(
     systemMessage("system_ready", currentReadyMessage()),
   );
 
-  if (attachedClaude) {
-    notifyCodexClaudeOnline();
+  if (frontends.hasConnectedFrontends()) {
+    notifyCodexConnectedFrontendsOnline();
   }
 });
 
@@ -158,7 +162,7 @@ codex.on("exit", (code: number | null) => {
   log(`Codex process exited (code ${code})`);
   statusBuffer.flush("codex exited");
   tuiConnectionState.handleCodexExit();
-  emitToClaude(
+  emitToFrontends(
     systemMessage(
       "system_codex_exit",
       `⚠️ Codex app-server exited (code ${code ?? "unknown"}). AgentBridge daemon is still running, but the Codex side needs to be restarted.`,
@@ -191,8 +195,8 @@ function startControlServer() {
       },
       close: (ws: ServerWebSocket<ControlSocketData>) => {
         log(`Frontend socket closed (#${ws.data.clientId})`);
-        if (attachedClaude === ws) {
-          detachClaude(ws, "frontend socket closed");
+        if (ws.data.frontendId) {
+          detachFrontend(ws, "frontend socket closed");
         }
       },
       message: (ws: ServerWebSocket<ControlSocketData>, raw) => {
@@ -213,19 +217,32 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
   }
 
   switch (message.type) {
-    case "claude_connect":
-      attachClaude(ws);
+    case "frontend_connect":
+      attachFrontend(ws, message.frontend);
       return;
+    case "claude_connect":
+      attachFrontend(ws, {
+        id: `claude_${ws.data.clientId}`,
+        source: "claude",
+        name: "Claude",
+      });
+      return;
+    case "frontend_disconnect":
     case "claude_disconnect":
-      detachClaude(ws, "frontend requested disconnect");
+      detachFrontend(ws, "frontend requested disconnect");
       return;
     case "status":
       sendStatus(ws);
       return;
+    case "frontend_to_codex":
     case "claude_to_codex": {
-      if (message.message.source !== "claude") {
+      const resultType = message.type === "claude_to_codex"
+        ? "claude_to_codex_result"
+        : "frontend_to_codex_result";
+
+      if (message.message.source === "codex") {
         sendProtocolMessage(ws, {
-          type: "claude_to_codex_result",
+          type: resultType,
           requestId: message.requestId,
           success: false,
           error: "Invalid message source",
@@ -235,7 +252,7 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
 
       if (!tuiConnectionState.canReply()) {
         sendProtocolMessage(ws, {
-          type: "claude_to_codex_result",
+          type: resultType,
           requestId: message.requestId,
           success: false,
           error: "Codex is not ready. Wait for TUI to connect and create a thread.",
@@ -243,8 +260,9 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
         return;
       }
 
-      const contentWithReminder = message.message.content + "\n\n" + BRIDGE_CONTRACT_REMINDER;
-      log(`Forwarding Claude → Codex (${message.message.content.length} chars)`);
+      const senderName = ws.data.frontendName ?? sourceLabel(message.message.source);
+      const contentWithReminder = `${formatPeerMessageForCodex(message.message, senderName)}\n\n${BRIDGE_CONTRACT_REMINDER}`;
+      log(`Forwarding ${senderName} → Codex (${message.message.content.length} chars)`);
       const injected = codex.injectMessage(contentWithReminder);
       if (!injected) {
         const reason = codex.turnInProgress
@@ -252,7 +270,7 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
           : "Injection failed: no active thread or WebSocket not connected.";
         log(`Injection rejected: ${reason}`);
         sendProtocolMessage(ws, {
-          type: "claude_to_codex_result",
+          type: resultType,
           requestId: message.requestId,
           success: false,
           error: reason,
@@ -260,8 +278,11 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
         return;
       }
       clearAttentionWindow(); // Claude successfully replied, end attention window
+      if (ws.data.frontendId) {
+        frontends.broadcastExcept(ws.data.frontendId, message.message, trySendBridgeMessage);
+      }
       sendProtocolMessage(ws, {
-        type: "claude_to_codex_result",
+        type: resultType,
         requestId: message.requestId,
         success: true,
       });
@@ -270,18 +291,33 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
   }
 }
 
-function attachClaude(ws: ServerWebSocket<ControlSocketData>) {
-  if (attachedClaude && attachedClaude !== ws) {
-    attachedClaude.close(4001, "replaced by a newer Claude session");
+function attachFrontend(
+  ws: ServerWebSocket<ControlSocketData>,
+  frontend: { id: string; source: FrontendSource; name: string },
+) {
+  const existing = frontends.get(frontend.id);
+  if (existing?.socket && existing.socket !== ws) {
+    existing.socket.data.attached = false;
+    existing.socket.data.frontendId = undefined;
+    existing.socket.data.frontendName = undefined;
+    existing.socket.data.frontendSource = undefined;
+    try {
+      existing.socket.close(4001, "replaced by a newer frontend session");
+    } catch {}
   }
 
-  attachedClaude = ws;
+  frontends.attach(frontend, ws);
   ws.data.attached = true;
+  ws.data.frontendId = frontend.id;
+  ws.data.frontendName = frontend.name;
+  ws.data.frontendSource = frontend.source;
   cancelIdleShutdown();
-  log(`Claude frontend attached (#${ws.data.clientId})`);
+  log(`${frontend.name} frontend attached (#${ws.data.clientId})`);
 
-  statusBuffer.flush("claude reconnected");
+  statusBuffer.flush(`${frontend.name} reconnected`);
   sendStatus(ws);
+
+  frontends.flushPending(frontend.id, trySendBridgeMessage);
 
   if (bufferedMessages.length > 0) {
     flushBufferedMessages(ws);
@@ -292,20 +328,24 @@ function attachClaude(ws: ServerWebSocket<ControlSocketData>) {
   }
 
   if (tuiConnectionState.canReply()) {
-    notifyCodexClaudeOnline();
+    notifyCodexFrontendOnline(frontend.name);
   }
 }
 
-function detachClaude(ws: ServerWebSocket<ControlSocketData>, reason: string) {
-  if (attachedClaude !== ws) return;
+function detachFrontend(ws: ServerWebSocket<ControlSocketData>, reason: string) {
+  if (!ws.data.frontendId) return;
 
-  attachedClaude = null;
+  frontends.detach(ws.data.frontendId);
   ws.data.attached = false;
-  log(`Claude frontend detached (#${ws.data.clientId}, ${reason})`);
+  log(`${ws.data.frontendName ?? "Frontend"} detached (#${ws.data.clientId}, ${reason})`);
 
   if (tuiConnectionState.canReply()) {
-    codex.injectMessage("⚠️ Claude Code went offline. AgentBridge is still running in the background; it will reconnect automatically when Claude reopens.");
+    notifyCodexFrontendOffline(ws.data.frontendName ?? "A frontend");
   }
+
+  ws.data.frontendId = undefined;
+  ws.data.frontendName = undefined;
+  ws.data.frontendSource = undefined;
 
   scheduleIdleShutdown();
 }
@@ -336,7 +376,7 @@ function clearAttentionWindow() {
 
 function scheduleIdleShutdown() {
   cancelIdleShutdown();
-  if (attachedClaude) return; // still has a client
+  if (frontends.hasConnectedFrontends()) return; // still has a client
 
   const snapshot = tuiConnectionState.snapshot();
   if (snapshot.tuiConnected) return; // TUI still connected
@@ -344,7 +384,7 @@ function scheduleIdleShutdown() {
   log(`No clients connected. Daemon will shut down in ${IDLE_SHUTDOWN_MS}ms if no one reconnects.`);
   idleShutdownTimer = setTimeout(() => {
     // Re-check before shutting down
-    if (attachedClaude || tuiConnectionState.snapshot().tuiConnected) {
+    if (frontends.hasConnectedFrontends() || tuiConnectionState.snapshot().tuiConnected) {
       log("Idle shutdown cancelled: client reconnected during grace period");
       return;
     }
@@ -359,11 +399,10 @@ function cancelIdleShutdown() {
   }
 }
 
-function emitToClaude(message: BridgeMessage) {
-  if (attachedClaude && attachedClaude.readyState === WebSocket.OPEN) {
-    if (trySendBridgeMessage(attachedClaude, message)) return;
-    // Send failed — fall through to buffer
-    log("Send to Claude failed, buffering message for retry on reconnect");
+function emitToFrontends(message: BridgeMessage) {
+  if (frontends.hasConnectedFrontends()) {
+    frontends.broadcast(message, trySendBridgeMessage);
+    return;
   }
 
   bufferedMessages.push(message);
@@ -376,7 +415,7 @@ function emitToClaude(message: BridgeMessage) {
 
 function trySendBridgeMessage(ws: ServerWebSocket<ControlSocketData>, message: BridgeMessage): boolean {
   try {
-    const result = ws.send(JSON.stringify({ type: "codex_to_claude", message } satisfies ControlServerMessage));
+    const result = ws.send(JSON.stringify({ type: "bridge_message", message } satisfies ControlServerMessage));
     if (typeof result === "number" && result <= 0) {
       log(`Bridge message send returned ${result} (0=dropped, -1=backpressure)`);
       return false;
@@ -411,8 +450,9 @@ function sendStatus(ws: ServerWebSocket<ControlSocketData>) {
 }
 
 function broadcastStatus() {
-  if (!attachedClaude) return;
-  sendStatus(attachedClaude);
+  for (const entry of frontends.connectedEntries()) {
+    if (entry.socket) sendStatus(entry.socket);
+  }
 }
 
 function sendProtocolMessage(ws: ServerWebSocket<ControlSocketData>, message: ControlServerMessage) {
@@ -429,10 +469,11 @@ function currentStatus(): DaemonStatus {
     bridgeReady: tuiConnectionState.canReply(),
     tuiConnected: snapshot.tuiConnected,
     threadId: codex.activeThreadId,
-    queuedMessageCount: bufferedMessages.length + statusBuffer.size,
+    queuedMessageCount: bufferedMessages.length + statusBuffer.size + frontends.pendingCount(),
     proxyUrl: codex.proxyUrl,
     appServerUrl: codex.appServerUrl,
     pid: process.pid,
+    connectedFrontends: frontends.connectedEntries().map((entry) => entry.identity),
   };
 }
 
@@ -444,8 +485,18 @@ function currentReadyMessage() {
   return `✅ Codex TUI connected (${codex.activeThreadId}). Bridge ready.`;
 }
 
-function notifyCodexClaudeOnline() {
-  codex.injectMessage("✅ AgentBridge connected to Claude Code.");
+function notifyCodexConnectedFrontendsOnline() {
+  for (const entry of frontends.connectedEntries()) {
+    notifyCodexFrontendOnline(entry.identity.name);
+  }
+}
+
+function notifyCodexFrontendOnline(name: string) {
+  codex.injectMessage(`✅ ${name} connected via AgentBridge.`);
+}
+
+function notifyCodexFrontendOffline(name: string) {
+  codex.injectMessage(`⚠️ ${name} went offline. AgentBridge is still running and it can reconnect automatically later.`);
 }
 
 function systemMessage(idPrefix: string, content: string): BridgeMessage {
@@ -477,11 +528,11 @@ async function bootCodex() {
     await codex.start();
     codexBootstrapped = true;
 
-    emitToClaude(systemMessage("system_waiting", currentWaitingMessage()));
+    emitToFrontends(systemMessage("system_waiting", currentWaitingMessage()));
     broadcastStatus();
   } catch (err: any) {
     log(`Failed to start Codex: ${err.message}`);
-    emitToClaude(
+    emitToFrontends(
       systemMessage(
         "system_codex_start_failed",
         `❌ AgentBridge failed to start Codex app-server: ${err.message}`,

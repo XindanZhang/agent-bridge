@@ -5,11 +5,11 @@
 
 [中文文档](README.zh-CN.md)
 
-Local bridge for bidirectional communication between Claude Code and Codex inside the same working session.
+Local bridge for bidirectional communication between Codex and MCP-capable CLI frontends inside the same working session.
 
 The current implementation uses a two-process architecture:
 
-- `bridge.ts` is the foreground MCP client started by Claude Code
+- `bridge.ts` is the foreground MCP client started by a frontend such as Claude Code or Gemini CLI
 - `daemon.ts` is a persistent local background process that owns the Codex app-server proxy and bridge state
 
 This means the foreground MCP process can exit when Claude Code closes, while the background daemon and Codex proxy keep running. When Claude Code starts again, it can reuse the existing daemon automatically.
@@ -18,7 +18,7 @@ This means the foreground MCP process can exit when Claude Code closes, while th
 
 **This project is:**
 
-- A local developer tool for connecting Claude Code and Codex in one workflow
+- A local developer tool for connecting Claude Code, Gemini CLI, and Codex in one workflow
 - A bridge that forwards messages between an MCP channel and the Codex app-server protocol
 - An experimental setup for human-in-the-loop collaboration between multiple agents
 
@@ -32,8 +32,8 @@ This means the foreground MCP process can exit when Claude Code closes, while th
 
 ```
 ┌──────────────┐          MCP stdio          ┌────────────────────┐
-│ Claude Code  │ ───────────────────────────▶ │ bridge.ts          │
-│ Session      │ ◀─────────────────────────── │ foreground client  │
+│ Claude /     │ ───────────────────────────▶ │ bridge.ts          │
+│ Gemini MCP   │ ◀─────────────────────────── │ foreground client  │
 └──────────────┘                              └─────────┬──────────┘
                                                         │
                                                         │ local control WS
@@ -55,12 +55,13 @@ This means the foreground MCP process can exit when Claude Code closes, while th
 
 | Direction | Path |
 |------|------|
-| **Codex → Claude** | `daemon.ts` captures `agentMessage` → control WS → `bridge.ts` → `notifications/claude/channel` |
-| **Claude → Codex** | Claude calls the `reply` tool → `bridge.ts` → control WS → `daemon.ts` → `turn/start` injects into the Codex thread |
+| **Codex → frontend(s)** | `daemon.ts` captures `agentMessage` → control WS → `bridge.ts` → MCP notification or pull queue |
+| **Frontend → Codex** | The frontend calls the `reply` tool → `bridge.ts` → control WS → `daemon.ts` → `turn/start` injects into the Codex thread |
+| **Frontend → peer frontend** | `daemon.ts` rebroadcasts the original message to other connected frontends so Claude and Gemini can see each other |
 
 ### Loop prevention
 
-Each message carries a `source` field (`"claude"` or `"codex"`). The bridge never forwards a message back to its origin.
+Each message carries a `source` field (`"claude"`, `"gemini"`, or `"codex"`). The bridge never forwards a message back to its origin.
 
 ## Prerequisites
 
@@ -102,6 +103,21 @@ codex --enable tui_app_server --remote ws://127.0.0.1:4501
 
 Codex `agentMessage` items are pushed into the Claude session automatically. Claude can reply back through the `reply` tool.
 
+### Gemini CLI (pull mode)
+
+Gemini CLI can attach to the same daemon as a second frontend. Register a separate MCP entry with Gemini-specific env:
+
+```bash
+gemini mcp add -s user agentbridge-gemini bun run /absolute/path/to/agent_bridge/src/bridge.ts \
+  -e AGENTBRIDGE_MODE=pull \
+  -e AGENTBRIDGE_FRONTEND_TYPE=gemini \
+  -e AGENTBRIDGE_FRONTEND_NAME=Gemini
+```
+
+Then start Gemini in the same workspace and use the `reply` / `get_messages` tools from AgentBridge. Claude and Gemini will both see Codex messages, and their replies will be rebroadcast to each other through the daemon.
+
+By default the frontend identity is stable per `(type, name)`, so reconnecting the same Claude or Gemini panel reuses its daemon-side queue. If you intentionally run multiple panels of the same frontend type, set a distinct `AGENTBRIDGE_FRONTEND_ID` or `AGENTBRIDGE_FRONTEND_NAME` for each one.
+
 ## File Structure
 
 ```
@@ -137,12 +153,16 @@ agent_bridge/
 | `CODEX_PROXY_PORT` | `4501` | Bridge proxy port for the Codex TUI |
 | `AGENTBRIDGE_CONTROL_PORT` | `4502` | Local control port between `bridge.ts` and `daemon.ts` |
 | `AGENTBRIDGE_PID_FILE` | `/tmp/agentbridge-daemon-4502.pid` | Daemon pid file used to avoid duplicate startup |
+| `AGENTBRIDGE_MODE` | `auto` | Frontend delivery mode. Use `pull` for Gemini CLI and API-key Claude setups |
+| `AGENTBRIDGE_FRONTEND_TYPE` | `claude` | Frontend source label used for routing and display (`claude` or `gemini`) |
+| `AGENTBRIDGE_FRONTEND_NAME` | `Claude` / `Gemini` | Human-readable frontend name shown to Codex and peer frontends |
+| `AGENTBRIDGE_FRONTEND_ID` | derived from type + name | Stable logical frontend id used for reconnects and per-frontend buffering |
 
 ## Current Limitations
 
 - Only forwards `agentMessage` items, not intermediate `commandExecution`, `fileChange`, or similar events
 - Single Codex thread, no multi-session support yet
-- Single Claude foreground connection; a new Claude session replaces the previous one
+- No room model yet: all connected frontends share the same Codex thread and see the same conversation
 
 ### Codex git restrictions
 
