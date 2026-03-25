@@ -16,6 +16,14 @@ This means the foreground MCP process can exit when Claude Code closes, while th
 
 System and lifecycle notices are emitted as `AgentBridge`, not as synthetic Codex output.
 
+Today the bridge supports one shared local collaboration room with three live participants:
+
+- `Codex` on the shared app-server thread
+- `Claude Code` as an MCP frontend
+- `Gemini CLI` as an MCP frontend
+
+All three can communicate in the same session. Claude and Gemini replies are injected into the shared Codex thread and also rebroadcast to the other connected frontend so every participant sees the same conversation.
+
 ## What this project is / is not
 
 **This project is:**
@@ -59,11 +67,20 @@ System and lifecycle notices are emitted as `AgentBridge`, not as synthetic Code
 |------|------|
 | **Codex → frontend(s)** | `daemon.ts` captures `agentMessage` → control WS → `bridge.ts` → MCP notification or pull queue |
 | **Frontend → Codex** | The frontend calls the `reply` tool → `bridge.ts` → control WS → `daemon.ts` → `turn/start` injects into the Codex thread |
-| **Frontend → peer frontend** | `daemon.ts` rebroadcasts the original message to other connected frontends so Claude and Gemini can see each other |
+| **Frontend → peer frontend(s)** | `daemon.ts` rebroadcasts the original message to the other connected frontends so Claude and Gemini stay in sync with the shared room |
 
 ### Loop prevention
 
-Each message carries a `source` field (`"claude"`, `"gemini"`, or `"codex"`). The bridge never forwards a message back to its origin.
+Each message carries a `source` field (`"claude"`, `"gemini"`, `"codex"`, or `"system"`). The bridge never forwards a message back to its origin, and the daemon validates that an attached frontend can only inject messages matching its own declared source.
+
+### Current collaboration model
+
+- There is one shared Codex thread.
+- Claude and Gemini can both attach to that same thread concurrently.
+- A reply from Claude is injected into Codex and rebroadcast to Gemini.
+- A reply from Gemini is injected into Codex and rebroadcast to Claude.
+- Codex messages are delivered to both connected frontends.
+- This is a shared-room model, not private pairwise channels.
 
 ## Prerequisites
 
@@ -122,6 +139,13 @@ By default the frontend identity is stable per `(type, name)`, so reconnecting t
 
 If the foreground MCP process temporarily loses the daemon control socket, it retries automatically and reattaches the same logical frontend when the daemon becomes reachable again.
 
+### Health endpoints
+
+The daemon exposes two local HTTP endpoints:
+
+- `/healthz`: daemon liveness and current status snapshot
+- `/readyz`: reply readiness for the shared Codex thread; returns `503` until the Codex side is actually ready
+
 ## File Structure
 
 ```
@@ -159,6 +183,8 @@ agent_bridge/
 | `CODEX_PROXY_PORT` | `4501` | Bridge proxy port for the Codex TUI |
 | `AGENTBRIDGE_CONTROL_PORT` | `4502` | Local control port between `bridge.ts` and `daemon.ts` |
 | `AGENTBRIDGE_PID_FILE` | `/tmp/agentbridge-daemon-4502.pid` | Daemon pid file used to avoid duplicate startup |
+| `AGENTBRIDGE_MAX_BUFFERED_MESSAGES` | `100` | Max queued messages retained for buffered delivery |
+| `AGENTBRIDGE_IDLE_SHUTDOWN_MS` | `30000` | How long the daemon stays alive with no TUI and no connected frontends |
 | `AGENTBRIDGE_MODE` | `auto` | Frontend delivery mode. Use `pull` for Gemini CLI and API-key Claude setups |
 | `AGENTBRIDGE_FRONTEND_TYPE` | `claude` | Frontend source label used for routing and display (`claude` or `gemini`) |
 | `AGENTBRIDGE_FRONTEND_NAME` | `Claude` / `Gemini` | Human-readable frontend name shown to Codex and peer frontends |
@@ -169,6 +195,8 @@ agent_bridge/
 - Only forwards `agentMessage` items, not intermediate `commandExecution`, `fileChange`, or similar events
 - Single Codex thread, no multi-session support yet
 - No room model yet: all connected frontends share the same Codex thread and see the same conversation
+- Replies into Codex are serialized by the shared turn state: if Codex is busy, the next frontend reply must wait for the current turn to finish
+- No explicit private channels yet: Claude↔Gemini visibility comes from shared-room rebroadcast, not separate side-channel routing
 
 ### Codex git restrictions
 
