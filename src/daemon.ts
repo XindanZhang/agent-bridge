@@ -38,7 +38,7 @@ const codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT);
 const attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
 
 let controlServer: ReturnType<typeof Bun.serve> | null = null;
-const frontends = new FrontendRegistry<ServerWebSocket<ControlSocketData>>();
+const frontends = new FrontendRegistry<ServerWebSocket<ControlSocketData>>(MAX_BUFFERED_MESSAGES);
 let nextControlClientId = 0;
 let nextSystemMessageId = 0;
 let codexBootstrapped = false;
@@ -67,7 +67,6 @@ const tuiConnectionState = new TuiConnectionState({
         `✅ Codex TUI reconnected (conn #${connId}). Bridge restored, communication can continue.`,
       ),
     );
-    codex.injectMessage("✅ AgentBridge frontend connection restored. Bidirectional communication can continue.");
   },
 });
 
@@ -135,9 +134,6 @@ codex.on("ready", (threadId: string) => {
     systemMessage("system_ready", currentReadyMessage()),
   );
 
-  if (frontends.hasConnectedFrontends()) {
-    notifyCodexConnectedFrontendsOnline();
-  }
 });
 
 codex.on("tuiConnected", (connId: number) => {
@@ -160,6 +156,7 @@ codex.on("error", (err: Error) => {
 
 codex.on("exit", (code: number | null) => {
   log(`Codex process exited (code ${code})`);
+  codexBootstrapped = false;
   statusBuffer.flush("codex exited");
   tuiConnectionState.handleCodexExit();
   emitToFrontends(
@@ -178,8 +175,13 @@ function startControlServer() {
     fetch(req, server) {
       const url = new URL(req.url);
 
-      if (url.pathname === "/healthz" || url.pathname === "/readyz") {
+      if (url.pathname === "/healthz") {
         return Response.json(currentStatus());
+      }
+
+      if (url.pathname === "/readyz") {
+        const status = currentStatus();
+        return Response.json(status, { status: status.bridgeReady ? 200 : 503 });
       }
 
       if (url.pathname === "/ws" && server.upgrade(req, { data: { clientId: 0, attached: false } })) {
@@ -240,12 +242,22 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
         ? "claude_to_codex_result"
         : "frontend_to_codex_result";
 
-      if (message.message.source === "codex") {
+      if (!ws.data.attached || !ws.data.frontendId || !ws.data.frontendSource) {
         sendProtocolMessage(ws, {
           type: resultType,
           requestId: message.requestId,
           success: false,
-          error: "Invalid message source",
+          error: "Frontend is not attached.",
+        });
+        return;
+      }
+
+      if (message.message.source !== ws.data.frontendSource) {
+        sendProtocolMessage(ws, {
+          type: resultType,
+          requestId: message.requestId,
+          success: false,
+          error: "Message source does not match the attached frontend.",
         });
         return;
       }
@@ -326,10 +338,6 @@ function attachFrontend(
   } else if (codexBootstrapped) {
     sendBridgeMessage(ws, systemMessage("system_waiting", currentWaitingMessage()));
   }
-
-  if (tuiConnectionState.canReply()) {
-    notifyCodexFrontendOnline(frontend.name);
-  }
 }
 
 function detachFrontend(ws: ServerWebSocket<ControlSocketData>, reason: string) {
@@ -338,10 +346,6 @@ function detachFrontend(ws: ServerWebSocket<ControlSocketData>, reason: string) 
   frontends.detach(ws.data.frontendId);
   ws.data.attached = false;
   log(`${ws.data.frontendName ?? "Frontend"} detached (#${ws.data.clientId}, ${reason})`);
-
-  if (tuiConnectionState.canReply()) {
-    notifyCodexFrontendOffline(ws.data.frontendName ?? "A frontend");
-  }
 
   ws.data.frontendId = undefined;
   ws.data.frontendName = undefined;
@@ -400,7 +404,7 @@ function cancelIdleShutdown() {
 }
 
 function emitToFrontends(message: BridgeMessage) {
-  if (frontends.hasConnectedFrontends()) {
+  if (frontends.list().length > 0) {
     frontends.broadcast(message, trySendBridgeMessage);
     return;
   }
@@ -485,24 +489,10 @@ function currentReadyMessage() {
   return `✅ Codex TUI connected (${codex.activeThreadId}). Bridge ready.`;
 }
 
-function notifyCodexConnectedFrontendsOnline() {
-  for (const entry of frontends.connectedEntries()) {
-    notifyCodexFrontendOnline(entry.identity.name);
-  }
-}
-
-function notifyCodexFrontendOnline(name: string) {
-  codex.injectMessage(`✅ ${name} connected via AgentBridge.`);
-}
-
-function notifyCodexFrontendOffline(name: string) {
-  codex.injectMessage(`⚠️ ${name} went offline. AgentBridge is still running and it can reconnect automatically later.`);
-}
-
 function systemMessage(idPrefix: string, content: string): BridgeMessage {
   return {
     id: `${idPrefix}_${++nextSystemMessageId}`,
-    source: "codex",
+    source: "system",
     content,
     timestamp: Date.now(),
   };
@@ -572,6 +562,13 @@ function log(msg: string) {
   } catch {}
 }
 
-writePidFile();
-startControlServer();
-void bootCodex();
+try {
+  startControlServer();
+  writePidFile();
+  scheduleIdleShutdown();
+  void bootCodex();
+} catch (err: any) {
+  log(`Fatal startup error: ${err.message}`);
+  removePidFile();
+  process.exit(1);
+}

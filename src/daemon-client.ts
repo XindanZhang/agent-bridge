@@ -5,12 +5,20 @@ import type { ControlClientMessage, ControlServerMessage, DaemonStatus } from ".
 interface DaemonClientEvents {
   bridgeMessage: [BridgeMessage];
   disconnect: [];
+  reconnected: [];
   status: [DaemonStatus];
+}
+
+interface DaemonClientOptions {
+  beforeReconnect?: () => Promise<void>;
+  maxReconnectAttempts?: number;
+  reconnectBaseDelayMs?: number;
 }
 
 export class DaemonClient extends EventEmitter<DaemonClientEvents> {
   private ws: WebSocket | null = null;
   private nextRequestId = 1;
+  private connectPromise: Promise<void> | null = null;
   private pendingReplies = new Map<
     string,
     {
@@ -18,18 +26,26 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
       timer: ReturnType<typeof setTimeout>;
     }
   >();
+  private shouldAttachFrontend = false;
+  private explicitlyDisconnected = false;
+  private reconnectAttempts = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnecting = false;
 
   constructor(
     private readonly url: string,
     private readonly frontend: FrontendIdentity,
+    private readonly options: DaemonClientOptions = {},
   ) {
     super();
   }
 
   async connect() {
     if (this.ws?.readyState === WebSocket.OPEN) return;
+    if (this.connectPromise) return this.connectPromise;
 
-    await new Promise<void>((resolve, reject) => {
+    this.explicitlyDisconnected = false;
+    const connectPromise = new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(this.url);
       let settled = false;
 
@@ -37,32 +53,62 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
         settled = true;
         this.ws = ws;
         this.attachSocketHandlers(ws);
+        this.reconnectAttempts = 0;
+        if (this.shouldAttachFrontend) {
+          this.send({ type: "frontend_connect", frontend: this.frontend });
+        }
+        if (this.reconnecting) {
+          this.reconnecting = false;
+          this.emit("reconnected");
+        }
         resolve();
       };
 
       ws.onerror = () => {
         if (settled) return;
         settled = true;
+        if (!this.explicitlyDisconnected) {
+          this.scheduleReconnect();
+        }
         reject(new Error(`Failed to connect to AgentBridge daemon at ${this.url}`));
       };
 
       ws.onclose = () => {
         if (settled) return;
         settled = true;
+        if (!this.explicitlyDisconnected) {
+          this.scheduleReconnect();
+        }
         reject(new Error(`AgentBridge daemon closed the connection during startup (${this.url})`));
       };
     });
+
+    this.connectPromise = connectPromise;
+    try {
+      await connectPromise;
+    } finally {
+      if (this.connectPromise === connectPromise) {
+        this.connectPromise = null;
+      }
+    }
   }
 
   attachFrontend() {
-    this.send({ type: "frontend_connect", frontend: this.frontend });
+    this.shouldAttachFrontend = true;
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.send({ type: "frontend_connect", frontend: this.frontend });
+    }
   }
 
   async disconnect() {
+    this.explicitlyDisconnected = true;
+    this.clearReconnectTimer();
     if (!this.ws) return;
 
     try {
-      this.send({ type: "frontend_disconnect", frontendId: this.frontend.id });
+      if (this.ws.readyState === WebSocket.OPEN) {
+        this.send({ type: "frontend_disconnect", frontendId: this.frontend.id });
+      }
     } catch {}
 
     try {
@@ -131,11 +177,46 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
       }
       this.rejectPendingReplies("AgentBridge daemon disconnected.");
       this.emit("disconnect");
+      if (!this.explicitlyDisconnected) {
+        this.scheduleReconnect();
+      }
     };
 
     ws.onerror = () => {
       // The close handler is the single place that tears down pending state.
     };
+  }
+
+  private scheduleReconnect() {
+    if (this.explicitlyDisconnected || this.reconnectTimer) return;
+
+    const maxReconnectAttempts = this.options.maxReconnectAttempts ?? 10;
+    if (this.reconnectAttempts >= maxReconnectAttempts) {
+      return;
+    }
+
+    const reconnectBaseDelayMs = this.options.reconnectBaseDelayMs ?? 1000;
+    const delay = Math.min(reconnectBaseDelayMs * Math.pow(2, this.reconnectAttempts), 30000);
+    this.reconnectAttempts++;
+    this.reconnecting = true;
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      if (this.explicitlyDisconnected) return;
+
+      try {
+        await this.options.beforeReconnect?.();
+        await this.connect();
+      } catch {
+        this.scheduleReconnect();
+      }
+    }, delay);
+    this.reconnectTimer.unref?.();
+  }
+
+  private clearReconnectTimer() {
+    if (!this.reconnectTimer) return;
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
   }
 
   private rejectPendingReplies(error: string) {

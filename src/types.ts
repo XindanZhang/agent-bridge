@@ -1,7 +1,7 @@
 // ===== Bridge Core Types =====
 
 export type FrontendSource = "claude" | "gemini";
-export type MessageSource = FrontendSource | "codex";
+export type MessageSource = FrontendSource | "codex" | "system";
 
 export interface FrontendIdentity {
   id: string;
@@ -22,6 +22,8 @@ export function sourceLabel(source: MessageSource) {
       return "Claude";
     case "gemini":
       return "Gemini";
+    case "system":
+      return "AgentBridge";
     case "codex":
     default:
       return "Codex";

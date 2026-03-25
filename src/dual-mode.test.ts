@@ -227,6 +227,22 @@ describe("Dual-mode transport: drainMessages (get_messages)", () => {
     expect(text).toContain("Claude: review this approach");
     expect(text).toContain("Gemini: I disagree with the current design");
   });
+
+  test("formats bridge system messages as AgentBridge instead of Codex", () => {
+    const adapter = createAdapter("pull");
+    adapter.resolveMode();
+
+    adapter.queueForPull({
+      id: "system_1",
+      source: "system",
+      content: "Daemon control connection lost",
+      timestamp: 1705312200000,
+    });
+
+    const text = adapter.drainMessages().content[0].text;
+    expect(text).toContain("[1 new message from AgentBridge]");
+    expect(text).toContain("AgentBridge: Daemon control connection lost");
+  });
 });
 
 describe("Dual-mode transport: reply pending hint", () => {

@@ -1,6 +1,8 @@
 import type { BridgeMessage, FrontendIdentity } from "./types";
 
 export class FrontendRegistry<T> {
+  constructor(private readonly maxPendingMessages = Number.POSITIVE_INFINITY) {}
+
   private entries = new Map<string, { identity: FrontendIdentity; socket: T | null; pending: BridgeMessage[] }>();
 
   get(identityId: string) {
@@ -88,6 +90,9 @@ export class FrontendRegistry<T> {
   ) {
     if (entry.socket && send(entry.socket, message)) return;
     entry.pending.push(message);
+    if (entry.pending.length > this.maxPendingMessages) {
+      entry.pending.splice(0, entry.pending.length - this.maxPendingMessages);
+    }
   }
 }
 

@@ -38,6 +38,19 @@ describe("FrontendRegistry", () => {
     expect(deliveries[0].socketId).toBe("socket-2");
     expect(deliveries[0].message.content).toBe("hello from claude");
   });
+
+  test("caps disconnected frontend backlog to the configured size", () => {
+    const registry = new FrontendRegistry<{ id: string }>(2);
+
+    registry.attach({ id: "gemini-1", source: "gemini", name: "Gemini" }, { id: "socket-2" });
+    registry.detach("gemini-1");
+
+    registry.broadcast(makeFrontendMessage("claude", "first"), () => true);
+    registry.broadcast(makeFrontendMessage("claude", "second"), () => true);
+    registry.broadcast(makeFrontendMessage("claude", "third"), () => true);
+
+    expect(registry.getPending("gemini-1").map((message) => message.content)).toEqual(["second", "third"]);
+  });
 });
 
 describe("formatPeerMessageForCodex", () => {

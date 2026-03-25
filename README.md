@@ -14,6 +14,8 @@ The current implementation uses a two-process architecture:
 
 This means the foreground MCP process can exit when Claude Code closes, while the background daemon and Codex proxy keep running. When Claude Code starts again, it can reuse the existing daemon automatically.
 
+System and lifecycle notices are emitted as `AgentBridge`, not as synthetic Codex output.
+
 ## What this project is / is not
 
 **This project is:**
@@ -118,6 +120,8 @@ Then start Gemini in the same workspace and use the `reply` / `get_messages` too
 
 By default the frontend identity is stable per `(type, name)`, so reconnecting the same Claude or Gemini panel reuses its daemon-side queue. If you intentionally run multiple panels of the same frontend type, set a distinct `AGENTBRIDGE_FRONTEND_ID` or `AGENTBRIDGE_FRONTEND_NAME` for each one.
 
+If the foreground MCP process temporarily loses the daemon control socket, it retries automatically and reattaches the same logical frontend when the daemon becomes reachable again.
+
 ## File Structure
 
 ```
@@ -134,6 +138,8 @@ agent_bridge/
 │   ├── control-protocol.ts   # Shared foreground/background control protocol
 │   ├── claude-adapter.ts     # MCP server adapter for Claude Code channels
 │   ├── codex-adapter.ts      # Codex app-server WebSocket proxy and message interception
+│   ├── frontend-identity.ts  # Stable frontend identity derivation for reconnects
+│   ├── frontend-registry.ts  # Per-frontend attachment and backlog tracking
 │   └── types.ts              # Shared types
 ├── CODE_OF_CONDUCT.md
 ├── CONTRIBUTING.md

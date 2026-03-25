@@ -21,7 +21,9 @@ const FRONTEND_NAME = process.env.AGENTBRIDGE_FRONTEND_NAME
 const FRONTEND_IDENTITY = buildFrontendIdentity(FRONTEND_SOURCE, FRONTEND_NAME);
 
 const frontendAdapter = new ClaudeAdapter();
-const daemonClient = new DaemonClient(CONTROL_WS_URL, FRONTEND_IDENTITY);
+const daemonClient = new DaemonClient(CONTROL_WS_URL, FRONTEND_IDENTITY, {
+  beforeReconnect: ensureDaemonRunning,
+});
 
 let shuttingDown = false;
 
@@ -50,7 +52,17 @@ daemonClient.on("disconnect", () => {
   log("Daemon control connection closed");
   void frontendAdapter.pushNotification(systemMessage(
     "system_daemon_disconnected",
-    `⚠️ AgentBridge daemon control connection lost. The Codex proxy may still be running in the background, but ${FRONTEND_NAME} cannot communicate bidirectionally right now.`,
+    `⚠️ AgentBridge daemon control connection lost. ${FRONTEND_NAME} will keep retrying in the background until the bridge becomes reachable again.`,
+  ));
+});
+
+daemonClient.on("reconnected", () => {
+  if (shuttingDown) return;
+
+  log("Daemon control connection restored");
+  void frontendAdapter.pushNotification(systemMessage(
+    "system_daemon_reconnected",
+    `✅ AgentBridge daemon control connection restored. ${FRONTEND_NAME} is attached again.`,
   ));
 });
 
@@ -58,15 +70,15 @@ frontendAdapter.on("ready", async () => {
   log(`MCP server ready for ${FRONTEND_NAME} (delivery mode: ${frontendAdapter.getDeliveryMode()}) — ensuring AgentBridge daemon...`);
 
   try {
+    daemonClient.attachFrontend();
     await ensureDaemonRunning();
     await daemonClient.connect();
-    daemonClient.attachFrontend();
   } catch (err: any) {
     log(`Failed to connect to daemon: ${err.message}`);
     await frontendAdapter.pushNotification(
       systemMessage(
         "system_daemon_connect_failed",
-        `❌ AgentBridge daemon failed to start or is unreachable: ${err.message}`,
+        `❌ AgentBridge daemon failed to start or is unreachable: ${err.message}. ${FRONTEND_NAME} will continue retrying automatically.`,
       ),
     );
   }
@@ -75,7 +87,7 @@ frontendAdapter.on("ready", async () => {
 function systemMessage(idPrefix: string, content: string): BridgeMessage {
   return {
     id: `${idPrefix}_${Date.now()}`,
-    source: "codex",
+    source: "system",
     content,
     timestamp: Date.now(),
   };
