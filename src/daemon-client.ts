@@ -100,6 +100,14 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
     }
   }
 
+  ensureReconnectLoop() {
+    if (this.explicitlyDisconnected) {
+      this.explicitlyDisconnected = false;
+    }
+    if (this.ws?.readyState === WebSocket.OPEN || this.connectPromise) return;
+    this.scheduleReconnect(0);
+  }
+
   async disconnect() {
     this.explicitlyDisconnected = true;
     this.clearReconnectTimer();
@@ -187,16 +195,16 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
     };
   }
 
-  private scheduleReconnect() {
+  private scheduleReconnect(delayOverrideMs?: number) {
     if (this.explicitlyDisconnected || this.reconnectTimer) return;
 
-    const maxReconnectAttempts = this.options.maxReconnectAttempts ?? 10;
+    const maxReconnectAttempts = this.options.maxReconnectAttempts ?? Number.POSITIVE_INFINITY;
     if (this.reconnectAttempts >= maxReconnectAttempts) {
       return;
     }
 
     const reconnectBaseDelayMs = this.options.reconnectBaseDelayMs ?? 1000;
-    const delay = Math.min(reconnectBaseDelayMs * Math.pow(2, this.reconnectAttempts), 30000);
+    const delay = delayOverrideMs ?? Math.min(reconnectBaseDelayMs * Math.pow(2, this.reconnectAttempts), 30000);
     this.reconnectAttempts++;
     this.reconnecting = true;
     this.reconnectTimer = setTimeout(async () => {

@@ -51,6 +51,30 @@ describe("FrontendRegistry", () => {
 
     expect(registry.getPending("gemini-1").map((message) => message.content)).toEqual(["second", "third"]);
   });
+
+  test("does not let newer live messages bypass an older queued message for the same frontend", () => {
+    const registry = new FrontendRegistry<{ id: string }>();
+    const delivered: string[] = [];
+    let firstDeliveryBlocked = true;
+
+    registry.attach({ id: "gemini-1", source: "gemini", name: "Gemini" }, { id: "socket-2" });
+
+    const send = (_socket: { id: string }, message: BridgeMessage) => {
+      if (message.content === "first" && firstDeliveryBlocked) {
+        firstDeliveryBlocked = false;
+        return false;
+      }
+
+      delivered.push(message.content);
+      return true;
+    };
+
+    registry.broadcast(makeFrontendMessage("claude", "first"), send);
+    registry.broadcast(makeFrontendMessage("claude", "second"), send);
+
+    expect(delivered).toEqual(["first", "second"]);
+    expect(registry.getPending("gemini-1")).toEqual([]);
+  });
 });
 
 describe("formatPeerMessageForCodex", () => {

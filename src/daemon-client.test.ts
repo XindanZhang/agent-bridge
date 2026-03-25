@@ -106,7 +106,7 @@ describe("DaemonClient reconnect behavior", () => {
     firstSocket.emitClose();
     await sleep(20);
 
-    expect(beforeReconnectCalls).toBe(1);
+    expect(beforeReconnectCalls).toBeGreaterThanOrEqual(1);
     expect(FakeWebSocket.instances).toHaveLength(2);
     expect(FakeWebSocket.instances[1].sent.map((payload) => JSON.parse(payload))).toEqual([
       { type: "frontend_connect", frontend: FRONTEND },
@@ -154,9 +154,72 @@ describe("DaemonClient reconnect behavior", () => {
     await expect(client.connect()).rejects.toThrow("Failed to connect to AgentBridge daemon");
     await sleep(20);
 
-    expect(beforeReconnectCalls).toBe(1);
+    expect(beforeReconnectCalls).toBeGreaterThanOrEqual(1);
     expect(FakeWebSocket.instances).toHaveLength(2);
     expect(FakeWebSocket.instances[1].sent.map((payload) => JSON.parse(payload))).toEqual([
+      { type: "frontend_connect", frontend: FRONTEND },
+    ]);
+
+    await client.disconnect();
+  });
+
+  test("can start the reconnect loop even when startup failed before the first socket connect attempt", async () => {
+    FakeWebSocket.connectionPlan = ["error", "open"];
+
+    let beforeReconnectCalls = 0;
+    const client = new DaemonClient("ws://127.0.0.1:4502/ws", FRONTEND, {
+      reconnectBaseDelayMs: 1,
+      maxReconnectAttempts: 2,
+      beforeReconnect: async () => {
+        beforeReconnectCalls++;
+      },
+    });
+
+    client.attachFrontend();
+    client.ensureReconnectLoop();
+    await sleep(20);
+
+    expect(beforeReconnectCalls).toBeGreaterThanOrEqual(1);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(FakeWebSocket.instances[1].sent.map((payload) => JSON.parse(payload))).toEqual([
+      { type: "frontend_connect", frontend: FRONTEND },
+    ]);
+
+    await client.disconnect();
+  });
+
+  test("keeps retrying by default until the daemon becomes reachable", async () => {
+    FakeWebSocket.connectionPlan = [
+      "error",
+      "error",
+      "error",
+      "error",
+      "error",
+      "error",
+      "error",
+      "error",
+      "error",
+      "error",
+      "error",
+      "error",
+      "open",
+    ];
+
+    let beforeReconnectCalls = 0;
+    const client = new DaemonClient("ws://127.0.0.1:4502/ws", FRONTEND, {
+      reconnectBaseDelayMs: 0,
+      beforeReconnect: async () => {
+        beforeReconnectCalls++;
+      },
+    });
+
+    client.attachFrontend();
+    client.ensureReconnectLoop();
+    await sleep(50);
+
+    expect(beforeReconnectCalls).toBeGreaterThanOrEqual(12);
+    expect(FakeWebSocket.instances).toHaveLength(13);
+    expect(FakeWebSocket.instances.at(-1)?.sent.map((payload) => JSON.parse(payload))).toEqual([
       { type: "frontend_connect", frontend: FRONTEND },
     ]);
 

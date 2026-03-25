@@ -81,6 +81,7 @@ frontendAdapter.on("ready", async () => {
         `❌ AgentBridge daemon failed to start or is unreachable: ${err.message}. ${FRONTEND_NAME} will continue retrying automatically.`,
       ),
     );
+    daemonClient.ensureReconnectLoop();
   }
 });
 

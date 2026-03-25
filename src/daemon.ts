@@ -4,6 +4,7 @@ import { appendFileSync, unlinkSync, writeFileSync } from "node:fs";
 import type { ServerWebSocket } from "bun";
 import { CodexAdapter } from "./codex-adapter";
 import { FrontendRegistry, formatPeerMessageForCodex } from "./frontend-registry";
+import { classifySocketSendStatus } from "./socket-send-status";
 import {
   BRIDGE_CONTRACT_REMINDER,
   StatusBuffer,
@@ -326,16 +327,18 @@ function attachFrontend(
   cancelIdleShutdown();
   log(`${frontend.name} frontend attached (#${ws.data.clientId})`);
 
-  statusBuffer.flush(`${frontend.name} reconnected`);
-  sendStatus(ws);
-
   frontends.flushPending(frontend.id, trySendBridgeMessage);
 
   if (bufferedMessages.length > 0) {
     flushBufferedMessages(ws);
-  } else if (tuiConnectionState.canReply()) {
+  }
+
+  statusBuffer.flush(`${frontend.name} reconnected`);
+  sendStatus(ws);
+
+  if (bufferedMessages.length === 0 && tuiConnectionState.canReply()) {
     sendBridgeMessage(ws, systemMessage("system_ready", currentReadyMessage()));
-  } else if (codexBootstrapped) {
+  } else if (bufferedMessages.length === 0 && codexBootstrapped) {
     sendBridgeMessage(ws, systemMessage("system_waiting", currentWaitingMessage()));
   }
 }
@@ -420,9 +423,15 @@ function emitToFrontends(message: BridgeMessage) {
 function trySendBridgeMessage(ws: ServerWebSocket<ControlSocketData>, message: BridgeMessage): boolean {
   try {
     const result = ws.send(JSON.stringify({ type: "bridge_message", message } satisfies ControlServerMessage));
-    if (typeof result === "number" && result <= 0) {
-      log(`Bridge message send returned ${result} (0=dropped, -1=backpressure)`);
-      return false;
+    if (typeof result === "number") {
+      const outcome = classifySocketSendStatus(result);
+      if (outcome === "dropped") {
+        log("Bridge message send returned 0 (dropped)");
+        return false;
+      }
+      if (outcome === "backpressure") {
+        log("Bridge message send returned -1 (queued with backpressure)");
+      }
     }
     return true;
   } catch (err: any) {

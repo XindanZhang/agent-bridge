@@ -61,13 +61,7 @@ export class FrontendRegistry<T> {
   flushPending(identityId: string, send: (socket: T, message: BridgeMessage) => boolean) {
     const entry = this.entries.get(identityId);
     if (!entry?.socket || entry.pending.length === 0) return;
-
-    const messages = entry.pending.splice(0, entry.pending.length);
-    for (const message of messages) {
-      if (send(entry.socket, message)) continue;
-      entry.pending.unshift(message, ...messages.slice(messages.indexOf(message) + 1));
-      return;
-    }
+    this.flushEntry(entry, send);
   }
 
   broadcast(message: BridgeMessage, send: (socket: T, message: BridgeMessage) => boolean) {
@@ -88,7 +82,36 @@ export class FrontendRegistry<T> {
     message: BridgeMessage,
     send: (socket: T, message: BridgeMessage) => boolean,
   ) {
-    if (entry.socket && send(entry.socket, message)) return;
+    if (!entry.socket) {
+      this.enqueuePending(entry, message);
+      return;
+    }
+
+    if (entry.pending.length > 0) {
+      this.enqueuePending(entry, message);
+      this.flushEntry(entry, send);
+      return;
+    }
+
+    if (send(entry.socket, message)) return;
+    this.enqueuePending(entry, message);
+  }
+
+  private flushEntry(
+    entry: { identity: FrontendIdentity; socket: T | null; pending: BridgeMessage[] },
+    send: (socket: T, message: BridgeMessage) => boolean,
+  ) {
+    while (entry.socket && entry.pending.length > 0) {
+      const next = entry.pending[0];
+      if (!send(entry.socket, next)) return;
+      entry.pending.shift();
+    }
+  }
+
+  private enqueuePending(
+    entry: { identity: FrontendIdentity; socket: T | null; pending: BridgeMessage[] },
+    message: BridgeMessage,
+  ) {
     entry.pending.push(message);
     if (entry.pending.length > this.maxPendingMessages) {
       entry.pending.splice(0, entry.pending.length - this.maxPendingMessages);
